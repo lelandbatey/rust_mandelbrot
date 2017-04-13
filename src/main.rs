@@ -1,10 +1,12 @@
-//use std::ops::{Add, Mul, Rem, BitXor, Not};
 
 extern crate argparse;
 
 use argparse::{ArgumentParser, Store};
 
+use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::ops::{Add, Mul};
+use std::thread;
 use std::fmt;
 use std::cmp;
 
@@ -74,6 +76,9 @@ impl Img {
         }
     }
 }
+
+// Print the contents of our "Img" struct according to the "Plane PGM" variant of the PGM standard:
+// http://netpbm.sourceforge.net/doc/pgm.html#plainpgm
 impl fmt::Display for Img {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f,
@@ -97,6 +102,9 @@ fn map_real_img(start: f64, end: f64, point: f64, intbound: i64) -> i64 {
     ((intbound as f64) * scaled) as i64
 }
 
+// Returns a Vector of "steps" length with values starting at "start" and ending at "stop",
+// inclusively. The first value of the returned vector (rv[0]) will always be equal to "start", and
+// the last value of the returned vector (rv[-1]) will always be equal to "stop".
 fn iterate(start: f64, stop: f64, steps: i64) -> Vec<f64> {
     let len = stop - start;
     let gap = len / (steps - 1) as f64;
@@ -118,24 +126,44 @@ fn mandelbrot(z: Complex, c: Complex, max_iters: i64) -> (Complex, i64) {
     (x, max_iters)
 }
 
+#[derive(Copy, Clone)]
+struct Pixel {
+    // x and y represent the coordinate of this pixel on an actual grid of pixels, with (0, 0) as
+    // the upper left and (height, width) as the lower right pixel.
+    x: i64,
+    y: i64,
+    // Val is any positive integer and is the brightness, with 0 being black, and the highest pixel
+    // value of all being pure white.
+    val: i64,
+    // rx and ry represent the coordinate of the pixel on the imaginary plane.
+    rx: f64,
+    ry: f64,
+}
+
 
 fn main() {
+    let mut thread_count = 4;
     let mut resolution = 2048;
     let mut max_iters = 120;
-    // x width = 2.52
-    // y height = 2.4
 
+    // We render square images centered on (-0.74, 0.0), that are by default 2.52 in real-number
+    // space on either side.
+    // This means we sample from (-2.0, -1.26) in the top left to (0.52, 1.26) in the bottom right.
     let (mut centerx, mut centery) = (-0.74, 0.0);
     let startzoom = 1.26;
 
     let mut zoomlevel = 1.0;
 
-    centerx = -0.7010733;
-    centery = 0.352329458;
+    //centerx = -0.7010733;
+    //centery = 0.352329458;
 
     {
         let mut argparse = ArgumentParser::new();
         argparse.set_description("Render a mandelbrot set as PGM");
+        argparse.refer(&mut thread_count)
+            .add_option(&["-t", "--threads"],
+                        Store,
+                        "Number of threads to use (default 4)");
         argparse.refer(&mut resolution)
             .add_option(&["-r", "--resolution"],
                         Store,
@@ -152,30 +180,76 @@ fn main() {
             .add_option(&["-z", "--zoom"], Store, "Amount of zoom in render");
         argparse.parse_args_or_exit();
     }
-    //centerx = -0.694871946;
-    //centery = 0.356592915764728;
-    //zoomlevel = 16.0;
 
     let (startx, stopx) = (centerx - (startzoom / (2.0 as f64).powf(zoomlevel)),
                            centerx + (startzoom / (2.0 as f64).powf(zoomlevel)));
     let (starty, stopy) = (centery - (startzoom / (2.0 as f64).powf(zoomlevel)),
                            centery + (startzoom / (2.0 as f64).powf(zoomlevel)));
-    //stopy = 0.0;
-    //stopx = startx + (stopx - startx) / 2.0;
-    //starty += 0.6;
-    //stopy += 0.6;
-    //startx += 0.1;
-    //stopx += 0.1;
 
     let mut img = Img::new(resolution, resolution);
-    for y in iterate(starty, stopy, img.height) {
-        for x in iterate(startx, stopx, img.width) {
-            let (n, itrs) = mandelbrot(cmplx(x, y), cmplx(x, y), max_iters);
-            let ix = map_real_img(startx, stopx, x, img.width);
-            let iy = map_real_img(starty, stopy, y, img.height);
-            img.set_px(ix, iy, cmp::min(itrs, 55));
-            //if n.real.powi(2) < 4.0 && n.imaginary.powi(2) < 4.0 {}
+    // Here we create a vector of Pixels for each thread, and populate each of those "pools of
+    // work" with ~equal numbers of pixels to be calculated.
+    let mut thread_work: Vec<Vec<Pixel>> = vec![Vec::new(); thread_count as usize];
+    {
+        for y in iterate(starty, stopy, img.height) {
+            for x in iterate(startx, stopx, img.width) {
+                // Calculate the coordinates in the image where this pixel will be located, based
+                // on it's x and y coordinates in the imaginary plane.
+                let ix = map_real_img(startx, stopx, x, img.width);
+                let iy = map_real_img(starty, stopy, y, img.height);
+                let ref mut work = thread_work[(ix % thread_count) as usize];
+                work.push(Pixel {
+                    x: ix,
+                    y: iy,
+                    val: 0,
+                    rx: x,
+                    ry: y,
+                });
+            }
         }
     }
+    // Use Arc to allow us to have multiple references to our vector of vectors of Pixels, as none
+    // of those vectors need to be modified, and each thread will be iterating only over separate
+    // vectors at one time.
+    let tw = Arc::new(thread_work);
+    let (tx, rx) = channel();
+    let mut children = vec![];
+    for idx in 0..thread_count {
+        let child_tw = tw.clone();
+        let child_tx = tx.clone();
+        // Spawn one thread for each thread in `thread_count`, with that thread in charge of only a
+        // single division of work. All Pixels are copied and sent back to the parent thread via a
+        // channel.
+        let child = thread::spawn(move || {
+            let ref work = child_tw[idx as usize];
+            for pix in work {
+                let (_, itrs) = mandelbrot(cmplx(pix.rx, pix.ry), cmplx(pix.rx, pix.ry), max_iters);
+                child_tx.send(Pixel {
+                        x: pix.x,
+                        y: pix.y,
+                        val: cmp::min(itrs, 55),
+                        rx: pix.rx,
+                        ry: pix.ry,
+                    })
+                    .unwrap();
+            }
+        });
+        children.push(child);
+    }
+
+    // Collect each Pixel and set it's corresponding location to the value of that Pixel in the
+    // Image.
+    for _ in 0..img.pixels.len() {
+        match rx.recv() {
+            Ok(pix) => {
+                img.set_px(pix.x, pix.y, pix.val);
+            }
+            Err(_) => break,
+        }
+    }
+    for child in children {
+        child.join().unwrap();
+    }
+
     print!("{}", img)
 }
