@@ -53,6 +53,7 @@ struct Img {
     height: i64,
     width: i64,
     maximum: i64,
+    minimum: i64,
     pixels: Vec<i64>,
 }
 
@@ -62,6 +63,7 @@ impl Img {
             height: h,
             width: w,
             maximum: 1,
+            minimum: 1000,
             pixels: vec![0; (h*w) as usize],
         }
     }
@@ -70,6 +72,9 @@ impl Img {
             if y < self.height && y >= 0 {
                 if val > self.maximum {
                     self.maximum = val
+                }
+                if val < self.minimum {
+                    self.minimum = val
                 }
                 self.pixels[((self.height * y) + x) as usize] = val
             }
@@ -85,11 +90,15 @@ impl fmt::Display for Img {
                "P2\n# Created by leland batey RustPGM\n{} {}\n{}\n",
                self.height,
                self.width,
-               self.maximum)
+               self.maximum - self.minimum)
             .unwrap();
         let pixvals: Vec<String> = self.pixels
             .iter()
-            .map(|pix| format!("{}", pix))
+            .map(|pix| if pix >= &self.minimum {
+                format!("{}", pix - self.minimum)
+            } else {
+                format!("{}", pix)
+            })
             .collect();
         write!(f, "{}\n", pixvals.join("\n"))
     }
@@ -119,7 +128,7 @@ fn mandelbrot(z: Complex, c: Complex, max_iters: i64) -> (Complex, i64) {
     let mut x = z.clone();
     for itr in 0..max_iters {
         x = x * x + c;
-        if x.real.abs() > 4.0 && x.imaginary.abs() > 4.0 {
+        if x.real.abs() > 2.0 && x.imaginary.abs() > 4.0 {
             return (x, itr);
         }
     }
@@ -227,7 +236,7 @@ fn main() {
                 child_tx.send(Pixel {
                         x: pix.x,
                         y: pix.y,
-                        val: cmp::min(itrs, 55),
+                        val: itrs,
                         rx: pix.rx,
                         ry: pix.ry,
                     })
